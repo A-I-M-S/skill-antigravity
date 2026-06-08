@@ -1,0 +1,15 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Antigravity auth + state (do not commit credentials)
+.antigravity/
+.antigravitycli/
+.gemini/antigravity-cli/
+
+# Logs
+*.log
