@@ -4,13 +4,13 @@ The five phases of every task the agent drives through `agy`. Each phase has a c
 
 ## Phase 1 — Install
 
-One-time, on the user's host. Agent-driven or user-driven.
+One-time, on the user's host. User-driven (the agent instructs; the user runs).
 
 ```bash
 curl -fsSL https://antigravity.google/cli/install.sh | bash
 source ~/.bashrc
-which agy   # expect ~/.local/bin/agy
-agy --version
+which agy          # ~/.local/bin/agy
+agy --version      # 1.0.6 or later
 ```
 
 ## Phase 2 — Auth
@@ -19,59 +19,92 @@ The user runs `agy` interactively once to complete browser OAuth.
 
 ```bash
 agy
-# → prints URL, opens browser, user signs in
-# → first-run setup flow: pick Secure / Review-driven / Agent-driven / Custom
+# → CLI opens browser to Antigravity auth page
+# → user signs in
+# → first-run flow: pick model, project, telemetry opt-out
+# → settings.json is populated
 ```
 
 Verify:
 
 ```bash
-agy models   # returns model list = signed in
+agy models         # succeeds = signed in
 ```
 
-**Checkpoint:** the user confirms sign-in is complete and the chosen setup policy.
+**Checkpoint:** the user confirms sign-in is complete and the chosen model and project.
 
 ## Phase 3 — Pre-flight
 
 The agent:
 
-- Confirms `which agy` resolves.
+- Confirms `which agy` resolves and `agy --version` is in range.
 - Confirms `agy models` succeeds (= authed).
-- Confirms the default model is `gemini-3.5-flash` (or asks the user to confirm a different one).
+- Reads `~/.gemini/antigravity-cli/settings.json` and reports the chosen `model` and `gcp.project`.
 - Reads `~/.gemini/antigravity-cli/cache/projects.json` and looks for an existing conversation in the current workspace.
-- Mentions `/settings` and the data-collection opt-out if the user has not seen it.
-- Confirms the user's setup policy (Review-driven vs Agent-driven). If Agent-driven with auto-approve, warn that `agy` will run tools without asking.
+- Asks the user: resume an existing conversation, or start a new one?
+- If `enableTelemetry` is `true`, mentions the data-collection opt-out and suggests flipping it to `false` in `settings.json`.
 
-**Checkpoint:** the user confirms pre-flight is good and the conversation to use (new vs `agy -c`).
+**Checkpoint:** the user confirms pre-flight is good and the conversation to use (new vs `-c` vs `--conversation <id>`).
 
-## Phase 4 — Plan → artifact → approve
+## Phase 4 — Plan → revise (until Approve)
 
-The agent drives a planning pass. First prompt is always a planning prompt.
-
-```bash
-agy -i --model gemini-3.5-flash --add-dir "$WORKSPACE"
-# types the planning prompt from assets/operator-prompts.md
-```
-
-`agy` produces a markdown artifact (Task List, Implementation Plan, Walkthrough, Code Diff). The agent reads `walkthrough.md` (or extracts the TUI buffer).
-
-The agent presents the artifact to the user verbatim and closes with: *"Reply Approve to execute, or leave a comment to revise."*
-
-If the user comments, the agent resumes with `agy -c` and sends the revision prompt. Loop until the user replies "Approve".
-
-## Phase 5 — Execute
-
-The agent resumes the same conversation and sends the approval prompt.
+The agent runs the planning prompt (from `assets/operator-prompts.md`) via `agy -p`.
 
 ```bash
-agy -c -i --model gemini-3.5-flash
-# types the approval prompt from assets/operator-prompts.md
+WORKSPACE="$PWD"
+OUT="$(agy -p "$PLAN_PROMPT" \
+    --model "Gemini 3.1 Pro (High)" \
+    --sandbox \
+    --add-dir "$WORKSPACE" 2>&1)"
 ```
 
-`agy` runs the plan, asks permission for tools as needed (the agent forwards prompts to the user), and finishes with a final `walkthrough.md` plus code diffs.
+`agy` returns a markdown proposal on stdout. The agent surfaces `$OUT` to the user verbatim in a fenced code block and closes with: *"Reply **Approve** to build, or leave a comment to revise."*
 
-The agent surfaces the final artifact to the user and reports completion. If the user wants another iteration, restart at Phase 4 with a new planning prompt in a resumed conversation.
+If the user comments, the agent resumes with `agy -c -p "$REVISE_PROMPT"` and loops until the user replies **Approve**. See `references/artifact-loop.md` for the full procedure.
+
+## Phase 5 — Build (after explicit Approve)
+
+The agent resumes the same conversation with the build prompt.
+
+```bash
+OUT="$(agy -c -p "$BUILD_PROMPT" \
+    --model "Gemini 3.1 Pro (High)" \
+    --sandbox \
+    --dangerously-skip-permissions 2>&1)"
+```
+
+`agy` runs the approved plan, writes files via its built-in tools, may run shell commands, and reports results on stdout. The agent surfaces the final output to the user and reports completion.
+
+If the user wants another iteration, restart at Phase 4 with a new planning prompt in a resumed conversation.
 
 ## End-to-end rule
 
-> The agent never invokes `agy` for execution without first having read and surfaced a `walkthrough.md` (or equivalent artifact) for the current task and received explicit "Approve".
+> The agent never invokes `agy` for build (Phase 5) without first having surfaced a proposal (Phase 4) for the current task and received explicit **Approve**.
+
+## Worked example (chatty version)
+
+```text
+User: refactor the cache module to split semantic vs search caches
+Agent: pre-flight OK. agy 1.0.6, authed, default model Gemini 3.1 Pro (High),
+       no existing conversation in this workspace. Starting a new conversation.
+       Running planning pass...
+       [runs agy -p with plan prompt]
+       [surfaces proposal verbatim]
+       Reply Approve to build, or leave a comment to revise.
+User: Approve
+Agent: running build...
+       [runs agy -c -p with build prompt, --dangerously-skip-permissions]
+       [surfaces final output]
+       Done. 4 files changed, 142 insertions, 38 deletions.
+```
+
+```text
+User: refactor the cache module
+User: (comment after seeing the plan) use 0.92 not 0.88
+Agent: revising...
+       [runs agy -c -p with revise prompt]
+       [surfaces revised proposal verbatim]
+       Reply Approve to build, or leave a comment to revise.
+User: Approve
+Agent: running build...
+```

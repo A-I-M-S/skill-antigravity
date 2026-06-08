@@ -1,34 +1,38 @@
-## Artifact loop — the skill's centerpiece
+## The Plan → approve → execute loop
 
-`agy` Planning mode produces **artifacts**: markdown files (Task Lists, Implementation Plans, Walkthroughs, Code Diffs, Screenshots, Browser Recordings). The user has confirmed the workflow: "Instead of planning mode, agy will create artifact in terms of md for me to approve." This document defines the five-step loop the agent runs.
+This is the skill's centerpiece. Every non-trivial task runs through three `agy -p` invocations. The prompts come from `assets/operator-prompts.md`.
+
+The "artifact" is `agy`'s response to the planning prompt: a markdown proposal. It is not a special binary output — it is just the text `agy` writes to stdout in `-p` mode. The skill captures it, surfaces it to the human, and gates the build on explicit approval.
 
 ## Step 1 — Plan
 
-The agent drives `agy` in interactive mode and types (or pipes) the planning prompt from `assets/operator-prompts.md`. The first prompt of every task is a planning prompt — no code is written until the user approves the artifact.
+The agent runs `agy -p` with the planning prompt. The prompt asks for a markdown proposal and forbids any file writes. `agy` returns the proposal on stdout.
 
 ```bash
-agy -i --model gemini-3.5-flash --add-dir "$WORKSPACE"
+PROMPT="$(cat assets/operator-prompts.md | awk '/^### Plan$/,/^### /{ if (!/^### / || /^### Plan$/) print }')"
+OUT="$(agy -p "$PROMPT" --model "Gemini 3.1 Pro (High)" --sandbox --add-dir "$WORKSPACE" 2>&1)"
 ```
 
-The planning prompt asks `agy` to produce a markdown artifact titled `walkthrough.md` containing: a task list, an implementation plan (files, functions, dependencies), risks, and a verification approach. It explicitly forbids code modification.
+(Or just paste the prompt inline; the `awk` example is for templating.)
 
-## Step 2 — Produce artifact
+The planning prompt must end with a clear marker — typically `AWAITING APPROVAL` — so the response has a recognizable end. The agent verifies the marker is present; if not, surface what `agy` actually said and ask the user how to proceed.
 
-`agy` runs in Planning mode and emits a markdown artifact. There are two capture paths:
+**Capture shape:**
 
-- **(a) File output** — the artifact is written to `walkthrough.md` in the workspace (this is the path the binary references by name). The agent reads it with `cat walkthrough.md` or by opening the file in the editor.
-- **(b) TUI output** — the agent's PTY capture buffer has the artifact text inline. The agent extracts the markdown block from the scrollback.
+```text
+[markdown proposal]
+...
+AWAITING APPROVAL
+```
 
-Path (a) is the canonical capture. Path (b) is the fallback when the binary doesn't write a file (e.g. `--print` mode, or when the prompt is mis-phrased and `agy` answers inline).
+## Step 2 — Surface to the human
 
-## Step 3 — Present to human
+The agent shows the proposal to the user **verbatim** in chat, in a fenced code block, and closes with the standard ask:
 
-The agent shows the artifact to the user **verbatim** in chat, in a fenced markdown code block, and closes with the standard ask:
-
-> Here is `agy`'s plan for the change. Please review and reply **Approve** to execute, or leave a comment to revise.
+> Here is `agy`'s plan for the change. Please review and reply **Approve** to build, or leave a comment to revise.
 >
 > ```markdown
-> # walkthrough
+> # plan
 >
 > ## Task list
 > - [ ] Add `cache.py` with `SemanticCache` + `SearchCache`
@@ -39,56 +43,66 @@ The agent shows the artifact to the user **verbatim** in chat, in a fenced markd
 >
 > ## Risks
 > - 0.88 similarity threshold is a guess; tune later
+>
+> AWAITING APPROVAL
 > ```
 
-The closing line is required on every artifact presentation. It is the contract that gates step 5.
+The closing line is required on every proposal presentation. It is the contract that gates step 3.
 
-## Step 4 — Incorporate comments
+## Step 2b — Revise (if the human comments)
 
-If the user leaves a comment instead of "Approve" (e.g. "Use 0.92 instead of 0.88"), the agent resumes the same conversation and forwards the comment as a revision prompt.
-
-```bash
-agy -c -i --model gemini-3.5-flash
-```
-
-Then types (or pipes) the revision prompt:
-
-> "Revise `walkthrough.md` per this comment: change `SEMANTIC_CACHE_SIMILARITY_THRESHOLD` from 0.88 to 0.92. Re-emit the artifact. Do NOT modify any code yet."
-
-`agy` revises the artifact. Loop back to step 3. The agent may iterate the revise-present loop as many times as the user wants.
-
-## Step 5 — Execute
-
-When the user replies "Approve" (or "Go", "LGTM", "Ship it", or any clear affirmative — when in doubt, ask), the agent resumes the same conversation and sends the approval prompt.
+If the user leaves a comment instead of "Approve" (e.g. "Use 0.92 instead of 0.88"), the agent resumes the same conversation with a revision prompt:
 
 ```bash
-agy -c -i --model gemini-3.5-flash
+agy -c -p "Revise the previous plan per this comment: use 0.92 instead of 0.88. Re-emit the full proposal in the same format. Do NOT modify any code yet. End with AWAITING APPROVAL." \
+    --model "Gemini 3.1 Pro (High)" --sandbox
 ```
 
-Then types (or pipes) the approval prompt:
+`agy` re-emits the proposal. Loop back to step 2 with the new proposal. The agent may iterate the revise–present loop as many times as the user wants.
 
-> "All items in `walkthrough.md` are approved. Proceed with the implementation plan. Report any deviations as you go."
+## Step 3 — Build (after explicit Approve)
 
-The agent lets `agy` run. `agy` may emit intermediate status, may ask permission to run tools (the agent driving a PTY must detect these and surface them to the user — see `references/question-handling.md`), and finishes by emitting a final `walkthrough.md` plus code diffs.
+When the user replies **Approve**, the agent resumes the same conversation and sends the build prompt.
+
+```bash
+agy -c -p "The plan is approved. Execute it as proposed. Report any deviations from the plan as you go. When done, summarize the changes." \
+    --model "Gemini 3.1 Pro (High)" \
+    --sandbox \
+    --dangerously-skip-permissions
+```
+
+`agy` runs the plan, may write files, may run shell commands, and reports results on stdout. The agent surfaces the final output to the human.
+
+**`--dangerously-skip-permissions` is used here only**, after approval. Do not use it in step 1 or step 2b — those are read-only proposals and don't need tool execution; if `agy` tries to run a tool in step 1, that is a sign the planning prompt was mis-phrased.
 
 ## The approval gate — explicit words
 
 The agent never invents approval. It waits for one of these from the human, verbatim or paraphrased:
 
-- "Approve"
-- "Go"
-- "LGTM"
-- "Ship it"
-- "Yes, proceed"
+- **Approve**
+- Go
+- LGTM
+- Ship it
+- Yes, proceed
 
 When in doubt — if the user says "looks good but...", "almost", or sends only a partial revision — the agent must re-confirm. The cost of one extra confirmation is much lower than executing a destructive action without consent.
 
 ## Why no `--plan` flag
 
-`agy` has no `--plan` CLI flag. The skill bridges this by:
+`agy` has no `--plan` CLI flag and no mode toggle. The skill bridges this by:
 
-1. Always using the planning prompt as turn 1 (forces a planning pass regardless of mode).
-2. Capturing the artifact from `walkthrough.md` (or the TUI buffer) and presenting it verbatim.
-3. Gating execution on the explicit word "Approve".
+1. Always sending a planning prompt as step 1 (forces a planning pass).
+2. Capturing the proposal from `-p` stdout and presenting it verbatim.
+3. Gating step 3 on the explicit word **Approve**.
 
-The agent must never invoke `agy` for execution without first having read and surfaced a `walkthrough.md` (or equivalent artifact) for the current task.
+The agent must never invoke `agy` for build (step 3) without first having read and surfaced a proposal (step 1) for the current task and received explicit **Approve**.
+
+## The "no file writes" rule for step 1
+
+The planning prompt explicitly forbids file writes. If `agy` writes a file in step 1, the agent should:
+
+1. Note the deviation.
+2. Decide whether the file is benign (e.g. a scratch note in `/tmp`) or destructive (e.g. it wrote code into the workspace).
+3. If destructive, surface to the user, do not proceed to step 3, and revise the planning prompt to be stricter (e.g. add "Do not call any tools. Output the proposal as text only.").
+
+In practice, the marker "Do not modify any code yet" + "Output the proposal as text in a fenced code block, do not call any tools" is enough to keep `agy` honest in step 1. See `assets/operator-prompts.md`.

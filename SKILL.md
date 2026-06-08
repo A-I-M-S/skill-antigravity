@@ -1,6 +1,6 @@
 ---
 name: skill-antigravity
-description: Control and operate Google Antigravity CLI (agy) via artifact-based approval. Use this skill to drive the Plan → artifact → approve → execute loop, manage sessions, select models, handle OAuth, and coordinate coding through Antigravity.
+description: Drive Google Antigravity CLI (agy) via operator prompts and an explicit Plan → approve → execute loop. Use this skill to run agy headless (-p), capture its markdown proposals, surface them to the human for approval, and only then run the build.
 ---
 
 # skill-antigravity
@@ -8,122 +8,157 @@ description: Control and operate Google Antigravity CLI (agy) via artifact-based
 ## Core rule
 
 The agent does not write code.
-All planning and coding happens inside `agy` (Google Antigravity CLI).
-The agent orchestrates `agy`, surfaces its markdown artifacts to the human, and waits for explicit approval before execution.
+
+The agent drives `agy` (Google Antigravity CLI) through operator prompts. For every non-trivial task, the agent runs three `agy -p` invocations:
+
+1. **Plan** — operator prompt asks `agy` for a markdown proposal. No files are written.
+2. **Approve** — human reviews the proposal and replies **Approve** (or leaves a comment for a revision round).
+3. **Build** — operator prompt tells `agy` the proposal is approved and to execute it.
+
+The agent never invents approval. Step 3 never runs without an explicit **Approve** in step 2.
 
 ## Pre-flight
 
-- Confirm the user has installed `agy`:
-  `curl -fsSL https://antigravity.google/cli/install.sh | bash`
-- Verify the binary is on PATH:
+Before driving `agy`, the agent confirms:
+
+- `agy` is on PATH:
   `which agy` (expect `~/.local/bin/agy`)
-- Verify authentication:
-  `agy models` — succeeds = signed in; returns "Please sign in" = not authed.
-- Confirm the default model is `gemini-3.5-flash` (per user decision).
-- Inspect `~/.gemini/antigravity-cli/cache/projects.json` for an existing session in the current workspace. Reuse it if present; never create a new conversation without user approval.
-- Mention the setup-policy choices the user made on first run: Review-driven vs Agent-driven, terminal execution policy, data-collection opt-out. If the user picked "Agent-driven" with auto-approve, warn that `agy` will run tools without asking.
-- Do not proceed without the user confirming pre-flight.
+- Version is in range:
+  `agy --version` (this skill is validated against v1.0.6; older versions may have a different surface)
+- The user is authenticated:
+  `agy models` succeeds when authed; returns a token error when not.
+- The user's chosen model and project:
+  `cat ~/.gemini/antigravity-cli/settings.json` → `model`, `gcp.project`
+- The current workspace's existing session (if any):
+  `cat ~/.gemini/antigravity-cli/cache/projects.json`
+- The setup policy: did the user opt out of telemetry? Is `enableTelemetry` set to `false` in `settings.json`? If not, mention it.
+
+The agent mentions these facts to the user and asks for confirmation before driving `agy`.
+
+**Install (one-time, user-driven):**
+
+```bash
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+source ~/.bashrc
+which agy   # ~/.local/bin/agy
+```
 
 ## Execution surfaces
 
-`agy` has two ways to run a task. Choose by task shape:
+`agy` has three invocation shapes. Choose by who is driving and what the task looks like.
 
-- **Interactive TUI** (`agy` or `agy -i "..."` or `agy --prompt-interactive "..."`): for multi-turn tasks, artifact review, permission prompts, mid-flight revisions. The agent drives a PTY, captures output, and forwards prompts to the user.
-- **Headless print** (`agy --print "..." --model gemini-3.5-flash`): for one-shot tasks, single turn, no artifact review. The response is on stdout. Will still emit a markdown artifact if the prompt asks for one.
+- **Headless print** — `agy -p "..."` / `agy --print "..."` / `agy --prompt "..."`
+  Single prompt, response on stdout, exits when done. Works in non-TTY environments. This is the agent's primary surface.
+- **Interactive TUI** — `agy` / `agy -i "..."` / `agy --prompt-interactive "..."`
+  Full-screen TUI (bubbletea). Needs a TTY; errors with `could not open /dev/tty` in headless. The user runs this directly when they want to chat with `agy` themselves. The agent does **not** drive the TUI.
+- **Resume a conversation** — `agy -c` / `agy --continue` / `agy --conversation <id>`
+  Continues an existing conversation. Compatible with both `-p` and TUI. Use `-c` for the most recent in the current workspace, `--conversation <id>` for a specific one.
 
-Decision rule: use the TUI whenever the task is multi-step, when revisions are expected, or when artifact review is the point. Use `--print` for one-shot code edits or short questions.
+Decision rule: use `-p` for everything the agent drives. Use TUI when the user wants to interact with `agy` directly. Use `-c` / `--conversation` to resume for revision rounds and builds.
 
-See `references/execution-surfaces.md` for the full PTY-capture pattern and the trade-offs.
+See `references/execution-surfaces.md`.
 
-## Agent mode
+## Plan → approve → execute (the centerpiece)
 
-`agy` exposes two modes: **Fast** (default) and **Planning**. There is no `--plan` flag — the mode is set inside the TUI, or you force Planning by phrasing the first prompt as a planning request that emits a markdown artifact before any code is touched.
+The skill runs every non-trivial task through three `agy -p` invocations. The prompts come from `assets/operator-prompts.md`.
 
-The agent must always force a planning pass in turn one. Concretely: the first prompt of every task is the planning prompt from `assets/operator-prompts.md`, which asks `agy` to produce a markdown artifact (typically `walkthrough.md`) without modifying any code. This gives the human a chance to approve before execution, regardless of the mode the user picked at setup time.
-
-See `references/agent-modes.md` for the details.
-
-## Artifact loop (the centerpiece)
-
-`agy` Planning mode produces **artifacts** — markdown files (Task Lists, Implementation Plans, Walkthroughs, Code Diffs). The user has confirmed: "Instead of planning mode, agy will create artifact in terms of md for me to approve." The skill implements that loop as a five-step procedure:
-
-1. **Plan** — the agent drives `agy` in TUI mode (or `--print`) and types the planning prompt from `assets/operator-prompts.md`. The prompt asks for a markdown artifact only; no code is written yet.
-2. **Produce artifact** — `agy` emits the artifact. Two capture paths:
-   - **(a) File output:** the artifact is written to `walkthrough.md` in the workspace (this is the path the binary references by name). The agent `cat`s it.
-   - **(b) TUI output:** the agent's PTY capture buffer has the artifact text inline. The agent extracts it.
-3. **Present to human** — the agent shows the artifact to the user **verbatim** in chat and closes with: *"Reply Approve to execute, or leave a comment to revise."*
-4. **Incorporate comments** — if the user leaves a comment, the agent resumes the same conversation with `agy -c` (or `agy --conversation <id>`) and sends the revision prompt. `agy` re-runs planning and emits a new artifact. Loop back to step 3.
-5. **Execute** — when the user replies "Approve" (or "Go", "LGTM", or any clear affirmative — when in doubt, ask), the agent resumes the same conversation and sends the approval prompt. `agy` runs the plan, emits a final `walkthrough.md`, and reports code diffs.
-
-The agent never invents approval. It always waits for the explicit word before step 5.
-
-Example — start a planning session:
+### 1. Plan
 
 ```bash
-agy -i --model gemini-3.5-flash --add-dir "$WORKSPACE"
+agy -p "$(cat assets/operator-prompts.md::plan)" \
+    --model "<exact-string-from-agy-models>" \
+    --sandbox \
+    --add-dir "$WORKSPACE"
 ```
 
-Example — resume the same conversation after a revision:
+`agy` returns a markdown proposal on stdout. The agent surfaces it to the human **verbatim** in a fenced code block, closing with:
+
+> Reply **Approve** to build, or leave a comment to revise.
+
+### 2. Approve (or revise)
+
+- If the human replies **Approve** (or "Go", "LGTM", "Ship it", or any clear affirmative), go to step 3.
+- If the human leaves a comment, resume the conversation and send a revision prompt:
 
 ```bash
-agy -c -i --model gemini-3.5-flash
+agy -p "$(cat assets/operator-prompts.md::revise)" -c \
+    --model "<model>" \
+    --sandbox
 ```
 
-See `references/artifact-loop.md` for the full example chat reply shape, capture-path details, and the revision round-trip.
+Loop back to step 1 with the new proposal.
+
+### 3. Build
+
+```bash
+agy -p "$(cat assets/operator-prompts.md::build)" -c \
+    --model "<model>" \
+    --sandbox \
+    --dangerously-skip-permissions
+```
+
+`agy` runs the plan, may write files via its built-in tools, may run shell commands, and reports results on stdout. The agent surfaces the final output to the human.
+
+The agent never invents approval. `--dangerously-skip-permissions` is used in step 3 only, and only after the human has explicitly approved the proposal in step 2.
+
+See `references/artifact-loop.md` for the full example, the revision round-trip, and the approval-gate rules.
 
 ## Session management
 
 - `agy` keeps a per-workspace history in `~/.gemini/antigravity-cli/cache/projects.json`.
-- The same workspace must always use the same conversation. Reusing conversations preserves context and decisions.
+- Reuse conversations: `-c` for the most recent in the current workspace, `--conversation <id>` for a specific one.
+- Verify a conversation exists before resuming; `agy --conversation <bogus>` fails fast.
 - Start a new conversation only with explicit user approval.
-- To resume the most recent conversation in the workspace: `agy -c`.
-- To resume a specific conversation by id: `agy --conversation <id>`.
-- Verify a conversation exists before resuming; `agy --conversation <bogus>` will fail.
+- The same workspace must always use the same conversation. Reusing conversations preserves context and decisions.
 
 See `references/session-management.md`.
 
 ## Model selection
 
-- **Default:** `gemini-3.5-flash` (per user decision).
-- **Per-invocation:** `agy --model <name>` or `agy -m <name>`.
-- **In TUI:** type `/model` and pick from the list.
-- **Verify availability:** `agy models` (auth required). Other models exposed by Antigravity include `gemini-3-pro`, `claude-sonnet-4.5`, `gpt-oss`. The agent must use a model that `agy models` actually lists — do not hard-code a list.
-- If the user requests a model that is not available, surface the `agy models` output verbatim and ask the user to pick one.
+- **Default:** the value in `~/.gemini/antigravity-cli/settings.json` → `model`. As of v1.0.6, common values are `Gemini 3.1 Pro (High)`, `Gemini 3.1 Pro (Low)`, `Gemini 3.5 Flash (Low)`, `Gemini 3.5 Flash (Medium)`, `Gemini 3.5 Flash (High)`, `Gemini 3 Flash`. Exact strings include the effort suffix in parentheses.
+- **Verify the current default:** `grep '"model"' ~/.gemini/antigravity-cli/settings.json`.
+- **Per-invocation override:** `agy --model "<name>"` — use the exact string from `agy models`.
+- **List available models:** `agy models` (auth required).
+- The agent must **not** hard-code a model list. Run `agy models` and use one it returns. If the user asked for a model that is not listed, surface the `agy models` output verbatim and ask the user to pick one.
 
 See `references/model-selection.md`.
 
 ## Auth flow
 
-- `agy` uses OAuth (no API key path). The OAuth token is stored in the system keyring.
-- On first run, `agy` prints a URL like:
+- `agy` uses OAuth (no API-key path). The token is stored at `~/.gemini/antigravity-cli/antigravity-oauth-token` (mode 0600).
+- On first run (or after `/logout`), `agy` requires a browser OAuth flow. The CLI opens a local browser to the Antigravity auth page. On remote/headless boxes, the user must copy the URL to a local browser.
+- **The agent does not perform OAuth on the user's behalf.** It instructs the user to run `agy` interactively to complete auth, then verifies with `agy models`.
+- **Verify auth:** `agy models` succeeds when authed; returns a token-source error when not.
+- **Sign out:** in the TUI, type `/logout` (TUI-only — there is no CLI flag for sign-out).
+- **Project id** is set in `settings.json` → `gcp.project` (not a CLI flag).
+- **First-run settings** are stored in `~/.gemini/antigravity-cli/settings.json`:
+  ```json
+  {
+    "enableTelemetry": false,
+    "gcp": {"project": "<project-id>", "location": "global"},
+    "model": "Gemini 3.1 Pro (High)"
+  }
   ```
-  Authentication required. Please visit the URL to log in:
-    https://accounts.google.com/o/oauth2/auth?access_type=offline&client_id=...&...
-  ```
-- The URL is valid for ~30 seconds. The CLI opens a browser locally; on remote/SSH, the user copies the URL to a local browser.
-- **The agent must surface the URL verbatim to the user** and not proceed without confirmation that auth completed.
-- **Verify auth:** `agy models` returns the model list when authed; returns "Please sign in" when not.
-- **Sign out:** open `agy`, type `/logout`.
+  Edit this file directly to change project, model, or telemetry.
 
 See `references/auth-flow.md`.
 
 ## Failure handling
 
-- **`agy` not installed** → show the install command. After install, `~/.local/bin/agy` is on PATH (may need `source ~/.bashrc`).
-- **Auth URL times out (30s)** → re-invoke `agy`. The URL is regenerated. Surface it verbatim.
-- **`agy models` returns "Please sign in"** → user must run `agy` interactively once to complete browser auth. Agent stops and asks the user to confirm.
-- **Permission prompt mid-task** → `agy` will ask before running a tool unless the user picked auto-approve at setup. The agent driving a PTY must detect the prompt and forward it to the user. Never use `--dangerously-skip-permissions` without explicit user consent per task.
-- **Sandbox blocks network** → instruct the user to retry without `--sandbox`, or change the bypass policy in `/settings`.
+- **`agy` not installed** → show the install command. After install, `~/.local/bin/agy` is on PATH; may need `source ~/.bashrc`.
+- **`agy models` returns a token error** → user must run `agy` interactively to complete browser auth. Agent stops, asks the user to confirm, then resumes.
+- **Permission prompt mid-task** → in `-p` mode the agent cannot forward interactive prompts. Pass `--dangerously-skip-permissions` only after the proposal is approved (step 3) and only with explicit user consent per task.
+- **Sandbox blocks something needed** → drop `--sandbox` for that invocation, or configure permissions in the TUI via `/permissions` (TUI-only).
 - **Model not available** → run `agy models`; pick from the list.
-- **Conversation not found** → `agy --conversation <id>` fails. Fall back to `agy -c` (most recent) or start a new conversation only with user approval.
+- **Conversation not found** → `agy --conversation <bogus>` fails. Fall back to `-c`, or start a new conversation only with user approval.
+- **TTY errors in headless** → the agent must use `-p` (or `-c -p`), not the bare TUI.
 
 See `references/failure-handling.md`.
 
 ## Output format
 
-- Show all `agy` commands and flags explicitly (no abbreviation).
-- Surface OAuth URLs **verbatim** — never paraphrase or trim them.
-- Surface markdown artifacts **verbatim** in fenced code blocks.
-- Close every artifact presentation with: *"Reply Approve to execute, or leave a comment to revise."*
-- State which conversation is in use (new vs `agy -c` vs `agy --conversation <id>`) and which model is selected.
-- State the current `agy` mode (Fast vs Planning) only when the user asks; the skill forces Planning by prompt phrasing, not by mode toggle.
+- Show all `agy` commands and flags explicitly.
+- Surface `agy`'s response **verbatim** in fenced code blocks.
+- Close every proposal presentation with: *"Reply **Approve** to build, or leave a comment to revise."*
+- State which conversation is in use (new vs `-c` vs `--conversation <id>`) and which model is selected.
+- Quote OAuth URLs verbatim when surfacing them — never paraphrase or trim.

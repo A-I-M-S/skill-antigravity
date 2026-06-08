@@ -1,21 +1,20 @@
 # skill-antigravity
 
-OpenClaw skill for controlling **Google Antigravity CLI** (`agy`) — Google's agentic development platform (Nov 2025, VS Code fork + agent-first Mission Control).
+OpenClaw skill for driving **Google Antigravity CLI** (`agy`) — Google's agentic development platform (Nov 2025, VS Code fork + agent-first Mission Control).
 
-This is an **operator-prompt skill**: pure markdown, no Python, no dependencies. It teaches an openclaw agent how to drive `agy` from a terminal through a structured **Plan → artifact → approve → execute** loop, then how to surface the result back to the human.
+This is an **operator-prompt skill**: pure markdown, no Python, no dependencies. It teaches an openclaw agent how to run `agy` headless (`-p`) through a structured **Plan → approve → execute** loop, capture `agy`'s markdown proposals, surface them to the human, and only then run the build.
 
 **This is NOT a code library.** There are no Python modules to import, no API to call. The skill is a markdown contract the consuming agent follows.
 
 ## What this skill does
 
-- Wraps the `agy` CLI (TUI and `--print`) for headless and non-interactive orchestration.
-- Drives the **Plan → Artifact → Approve → Execute** loop:
-  1. **Plan** — the agent sends the task to `agy` with a planning prompt that asks for a markdown artifact (`walkthrough.md`), no code yet.
-  2. **Artifact** — `agy` writes the artifact to disk (or emits it in the TUI). The agent captures it.
-  3. **Approve** — the agent surfaces the artifact to the human **verbatim** and waits for the explicit word "Approve" (or a clear affirmative).
-  4. **Execute** — once approved, the agent resumes the same `agy` conversation with the approval prompt; `agy` runs the plan and emits the final `walkthrough.md` plus code diffs.
-- Manages session reuse (`agy -c`, `agy --conversation <id>`), model selection (default `gemini-3.5-flash`), and OAuth handoff.
-- Closes the gap left by `agy`'s lack of a `--plan` flag: planning is forced by prompt phrasing, not by mode toggle.
+- Wraps the `agy` CLI's real surface: `-p` (headless print) for agent-driven work, TUI for user-driven work, `-c` / `--conversation` for resumption.
+- Drives the **Plan → approve → execute** loop:
+  1. **Plan** — the agent sends the task to `agy -p` with a planning prompt that asks for a markdown proposal. No code is written.
+  2. **Approve** — the agent surfaces the proposal to the human **verbatim** and waits for the explicit word **Approve** (or a clear affirmative, or a comment for revision).
+  3. **Build** — once approved, the agent resumes the same conversation with `agy -p -c` and the build prompt; `agy` runs the plan, writes files, and reports results.
+- Manages session reuse (`agy -c`, `agy --conversation <id>`), model selection (default from `settings.json`), and OAuth handoff.
+- Forces a planning pass on every non-trivial task by prompt phrasing — `agy` has no `--plan` flag, so the planning prompt is the gate.
 
 ## Install
 
@@ -29,6 +28,7 @@ cd skill-antigravity
 # The skill itself needs no install. The CLI it drives does:
 curl -fsSL https://antigravity.google/cli/install.sh | bash
 source ~/.bashrc
+which agy   # ~/.local/bin/agy
 ```
 
 ## Quick start
@@ -36,16 +36,22 @@ source ~/.bashrc
 ```bash
 # 1. Verify the binary
 which agy          # expect ~/.local/bin/agy
+agy --version      # validated against 1.0.6
 
-# 2. Authenticate (one-time, browser OAuth)
+# 2. Authenticate (one-time, browser OAuth via Antigravity)
 agy
-# → prints URL, opens browser, user signs in
+# → CLI opens browser, user signs in
+# → settings.json is populated with model and project
 
 # 3. Verify auth
 agy models         # returns the model list = signed in
 
-# 4. Read the procedure
-# The agent reads SKILL.md and follows the five-step loop.
+# 4. Inspect default settings
+cat ~/.gemini/antigravity-cli/settings.json
+# { "model": "Gemini 3.1 Pro (High)", "gcp": {"project": "...", "location": "global"}, "enableTelemetry": false }
+
+# 5. Read the procedure
+# The agent reads SKILL.md and follows the three-step loop.
 # See references/workflow.md for the end-to-end walkthrough.
 ```
 
@@ -55,17 +61,16 @@ agy models         # returns the model list = signed in
 |------|---------|
 | `SKILL.md` | Main procedure the agent follows. |
 | `skill-card.md` | Publisher description, use case, risks, references. |
-| `references/command-cheatsheet.md` | Every `agy` subcommand, flag, and TUI slash command. |
-| `references/artifact-loop.md` | The Plan → artifact → approve → execute loop (the centerpiece). |
-| `references/agent-modes.md` | Fast vs Planning; how to force planning without a `--plan` flag. |
-| `references/execution-surfaces.md` | TUI vs `--print`; when to use each. |
-| `references/auth-flow.md` | OAuth URL format, verifying auth, `/logout`. |
+| `references/command-cheatsheet.md` | Real `agy` flags, subcommands, and TUI slash commands (validated against v1.0.6). |
+| `references/artifact-loop.md` | The Plan → approve → execute loop, the approval-gate rules, the revision round-trip. |
+| `references/execution-surfaces.md` | `-p` (headless) vs TUI vs resume; when to use each. |
+| `references/auth-flow.md` | OAuth via Antigravity, settings.json, `/logout`. |
 | `references/session-management.md` | Detecting and resuming `agy` conversations. |
-| `references/model-selection.md` | Default `gemini-3.5-flash`, switching models, verifying availability. |
+| `references/model-selection.md` | Default from `settings.json`, switching models, verifying availability. |
 | `references/workflow.md` | End-to-end worked example (install → auth → plan → approve → execute). |
 | `references/failure-handling.md` | Common failures and how to respond. |
-| `references/question-handling.md` | `agy` asking the agent vs asking the human. |
-| `assets/operator-prompts.md` | Ready-to-paste prompts (Planning, Approval, Revision, Code-review, Walkthrough). |
+| `references/question-handling.md` | `agy` asking the agent vs asking the human; never inventing "yes" on destructive actions. |
+| `assets/operator-prompts.md` | Ready-to-paste prompts (Plan, Approve, Revise, Build, Code-review, Walkthrough, Re-auth). |
 
 ## Related
 
